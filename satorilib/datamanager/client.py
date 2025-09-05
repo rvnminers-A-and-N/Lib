@@ -187,7 +187,8 @@ class DataClient:
                 # await self.handleMessageForServer(message)
                 pass
             elif message.streamInfo is not None:
-                await self.handleMessageForSubscriberClients(message)
+                pass
+                # await self.handleMessageForSubscriberClients(message)
             subscription = self._findSubscription(
                 subscription=Subscription(message.uuid)
             )
