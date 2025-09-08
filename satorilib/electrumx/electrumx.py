@@ -94,25 +94,16 @@ class Electrumx(ElectrumxConnection):
     #})
 
     electrumxServers: list[str] = [
-        '128.199.1.149:50002',
-        '146.190.149.237:50002',
-        '146.190.38.120:50002',
-        'electrum1-mainnet.evrmorecoin.org:50002',
-        'electrum2-mainnet.evrmorecoin.org:50002',
-        'electrumx.satorinet.ie:50002', #WilQSL
-        #'1-electrum.satorinet.ie:50002', #WilQSL
-        #'evr-electrum.wutup.io:50002', #Kasvot Växt
+        'electrumx1.satorinet.io:50002',
+        'electrumx2.satorinet.io:50002',
+        'electrumx3.satorinet.io:50002',
     ]
 
     # subscriptions work better without ssl for some reason
     electrumxServersWithoutSSL: list[str] = [
-        '128.199.1.149:50001',
-        '146.190.149.237:50001',
-        '146.190.38.120:50001',
-        'electrum1-mainnet.evrmorecoin.org:50001',
-        'electrum2-mainnet.evrmorecoin.org:50001',
-        #'135.181.212.189:50001', #WilQSL
-        #'evr-electrum.wutup.io:50001', #Kasvot Växt
+        'electrumx1.satorinet.io:50001',
+        'electrumx2.satorinet.io:50001',
+        'electrumx3.satorinet.io:50001',
     ]
 
     @staticmethod
