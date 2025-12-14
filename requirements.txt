@@ -7,20 +7,20 @@
 
 setuptools>=68.0.0  # Updated for Python 3.12 compatibility (distutils removed)
 
-## needed for engine
-pandas==1.5.2 # 1.3.4
-joblib==1.2.0 # 1.0.1
-numpy==1.24.0 # 1.23.0
+## needed for engine - Updated for Python 3.12 compatibility
+pandas>=2.0.0  # 1.5.2 has no Python 3.12 wheel
+joblib>=1.2.0
+numpy>=1.24.0
 
-## needed for data managemnet
-pyarrow==10.0.1 # 6.0.1
-fastparquet==2022.12.0 # 0.7.2 # fastparquet-2022.12.0
+## needed for data management - Updated for Python 3.12 compatibility
+pyarrow>=10.0.1
+fastparquet>=2022.12.0
 
 ## needed for configuration management
-PyYAML==6.0 #5.4.1
+PyYAML>=6.0.1  # 6.0 has Python 3.12 issues
 
 ## needed for getting system data
-psutil==5.9.0 #5.8.0
+psutil>=5.9.0
 
 ## needed for wallet
 python-ravencoinlib==0.2.2

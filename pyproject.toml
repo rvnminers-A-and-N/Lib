@@ -1,0 +1,22 @@
+# Build system requirements for Python 3.12+ compatibility
+# setuptools >= 68.0.0 is required because Python 3.12 removed distutils
+
+[build-system]
+requires = ["setuptools>=68.0.0", "wheel", "cython>=3.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "satorilib"
+version = "0.0.1"
+description = "Satori Network Library"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["satorilib*"]
