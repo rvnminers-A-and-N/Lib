@@ -62,3 +62,6 @@ requests>=2.31.0
 sanic>=23.6.0
 aiosqlite>=0.19.0
 uvloop>=0.19.0
+
+# P2P networking support (optional - enables hybrid/p2p modes)
+satorip2p>=1.0.0
