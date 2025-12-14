@@ -1,4 +1,4 @@
-setuptools==65.6.3 # 56.0.0
+setuptools>=68.0.0  # Updated for Python 3.12 compatibility (distutils removed)
 
 ## needed for wallet
 python-ravencoinlib==0.2.2
