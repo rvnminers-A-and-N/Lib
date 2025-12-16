@@ -37,12 +37,26 @@ import traceback
 import datetime as dt
 
 
+def _get_networking_mode() -> str:
+    """Get the current networking mode from environment or config."""
+    import os
+    mode = os.environ.get('SATORI_NETWORKING_MODE')
+    if mode is None:
+        try:
+            from satorilib import config
+            mode = config.get().get('networking mode', 'central')
+        except Exception:
+            mode = 'central'
+    return mode.lower().strip()
+
+
 class SatoriServerClient(object):
     def __init__(
         self,
         wallet: Wallet,
         url: str = None,
         sendingUrl: str = None,
+        networking_mode: str = None,
         *args, **kwargs
     ):
         self.wallet = wallet
@@ -50,6 +64,42 @@ class SatoriServerClient(object):
         self.sendingUrl = sendingUrl or 'https://mundo.satorinet.io'
         self.topicTime: dict[str, float] = {}
         self.lastCheckin: int = 0
+        # P2P Integration
+        self.networking_mode = networking_mode or _get_networking_mode()
+        self._p2p_client = None  # Lazy initialized
+
+    def _get_p2p_client(self):
+        """Lazy initialize P2P client for hybrid/p2p modes."""
+        if self._p2p_client is None and self.networking_mode in ('hybrid', 'p2p'):
+            try:
+                from satorip2p.peers import Peers
+                from satorip2p.protocol.peer_registry import PeerRegistry
+                from satorip2p.protocol.stream_registry import StreamRegistry
+                from satorip2p.protocol.oracle_network import OracleNetwork
+                from satorip2p.protocol.prediction_protocol import PredictionProtocol
+
+                self._p2p_client = {
+                    'peers': None,  # Will be initialized by Neuron
+                    'peer_registry': None,
+                    'stream_registry': None,
+                    'oracle_network': None,
+                    'prediction_protocol': None,
+                }
+                logging.info("P2P client structures initialized", color="green")
+            except ImportError as e:
+                logging.warning(f"satorip2p not available: {e}")
+        return self._p2p_client
+
+    def set_p2p_peers(self, peers):
+        """Set the P2P peers instance from Neuron."""
+        client = self._get_p2p_client()
+        if client:
+            client['peers'] = peers
+
+    def is_p2p_available(self) -> bool:
+        """Check if P2P is available and initialized."""
+        client = self._get_p2p_client()
+        return client is not None and client.get('peers') is not None
 
     def setTopicTime(self, topic: str):
         self.topicTime[topic] = time.time()
@@ -212,23 +262,75 @@ class SatoriServerClient(object):
             payload=payload or json.dumps(stream or {}))
 
     def checkin(self, referrer: str = None, ip: str = None, vaultInfo: dict = None) -> dict:
-        challenge = self._getChallenge()
-        response = self._makeAuthenticatedCall(
-            function=requests.post,
-            endpoint='/checkin',
-            payload=self.wallet.registerPayload(challenge=challenge, vaultInfo=vaultInfo),
-            challenge=challenge,
-            extraHeaders={
-                **({'referrer': referrer} if referrer else {}),
-                **({'ip': ip} if ip else {})},
-            raiseForStatus=False)
-        try:
-            response.raise_for_status()
-        except requests.exceptions.HTTPError as e:
-            logging.error('unable to checkin:', response.text, e, color='red')
-            return {'ERROR': response.text}
-        self.lastCheckin = time.time()
-        return response.json()
+        """
+        Check in with the network.
+
+        In hybrid mode: tries P2P first, falls back to central.
+        In p2p mode: only uses P2P announcement.
+        In central mode: only uses central server.
+        """
+        result = {}
+
+        # P2P announcement for hybrid/p2p modes
+        if self.networking_mode in ('hybrid', 'p2p') and self.is_p2p_available():
+            try:
+                import asyncio
+                from satorip2p.protocol.peer_registry import PeerRegistry
+
+                client = self._get_p2p_client()
+                if client and client.get('peers'):
+                    if client.get('peer_registry') is None:
+                        client['peer_registry'] = PeerRegistry(client['peers'])
+
+                    async def _announce():
+                        await client['peer_registry'].start()
+                        return await client['peer_registry'].announce(capabilities=["predictor"])
+
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            asyncio.create_task(_announce())
+                        else:
+                            loop.run_until_complete(_announce())
+                    except RuntimeError:
+                        asyncio.run(_announce())
+
+                    logging.info("P2P announcement completed", color="green")
+                    result['p2p_announced'] = True
+
+            except Exception as e:
+                logging.warning(f"P2P announcement failed: {e}")
+                result['p2p_error'] = str(e)
+
+        # Central server checkin for central/hybrid modes
+        if self.networking_mode in ('central', 'hybrid'):
+            try:
+                challenge = self._getChallenge()
+                response = self._makeAuthenticatedCall(
+                    function=requests.post,
+                    endpoint='/checkin',
+                    payload=self.wallet.registerPayload(challenge=challenge, vaultInfo=vaultInfo),
+                    challenge=challenge,
+                    extraHeaders={
+                        **({'referrer': referrer} if referrer else {}),
+                        **({'ip': ip} if ip else {})},
+                    raiseForStatus=False)
+                try:
+                    response.raise_for_status()
+                    self.lastCheckin = time.time()
+                    result.update(response.json())
+                except requests.exceptions.HTTPError as e:
+                    logging.error('unable to checkin:', response.text, e, color='red')
+                    if self.networking_mode == 'central':
+                        return {'ERROR': response.text}
+                    result['central_error'] = response.text
+            except Exception as e:
+                logging.warning(f"Central server checkin failed: {e}")
+                if self.networking_mode == 'central':
+                    return {'ERROR': str(e)}
+                result['central_error'] = str(e)
+
+        return result
 
     def checkinCheck(self) -> bool:
         challenge = self._getChallenge()
