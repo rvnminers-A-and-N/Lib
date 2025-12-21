@@ -77,6 +77,17 @@ class SatoriServerClient(object):
                 from satorip2p.protocol.stream_registry import StreamRegistry
                 from satorip2p.protocol.oracle_network import OracleNetwork
                 from satorip2p.protocol.prediction_protocol import PredictionProtocol
+                # New protocol features
+                from satorip2p.protocol.versioning import (
+                    ProtocolVersion, VersionNegotiator, PeerVersionTracker,
+                    PROTOCOL_VERSION, get_current_version
+                )
+                from satorip2p.protocol.storage import (
+                    StorageManager, DeferredRewardsStorage, AlertStorage
+                )
+                from satorip2p.protocol.bandwidth import (
+                    BandwidthTracker, QoSManager, create_qos_manager
+                )
 
                 self._p2p_client = {
                     'peers': None,  # Will be initialized by Neuron
@@ -84,6 +95,16 @@ class SatoriServerClient(object):
                     'stream_registry': None,
                     'oracle_network': None,
                     'prediction_protocol': None,
+                    # Existing managers
+                    'alert_manager': None,
+                    'deferred_rewards_manager': None,
+                    # New protocol feature managers
+                    'version_tracker': None,
+                    'version_negotiator': None,
+                    'storage_manager': None,
+                    'bandwidth_tracker': None,
+                    'qos_manager': None,
+                    'protocol_version': PROTOCOL_VERSION,
                 }
                 logging.info("P2P client structures initialized", color="green")
             except ImportError as e:
@@ -1471,18 +1492,34 @@ class SatoriServerClient(object):
 
     def setMiningMode(self, status: bool) -> tuple[bool, dict]:
         """
-        Function to set the worker mining mode
+        Set the worker mining mode.
+
+        In P2P mode, stores preference locally.
+        In hybrid/central mode, syncs with central server.
         """
+        mode = _get_networking_mode()
+
+        # In P2P mode, store locally (mining mode is a local preference)
+        if mode == 'p2p':
+            self._mining_mode = status
+            return True, {'mining_mode': status, 'stored': 'local'}
+
+        # Hybrid/central: sync with server
         try:
             response = self._makeAuthenticatedCall(
                 function=requests.get,
                 endpoint='/worker/mining/mode/enable' if status else '/worker/mining/mode/disable')
             if response.status_code == 200:
+                self._mining_mode = status
                 return True, response.text
             else:
                 error_message = f"Server returned status code {response.status_code}: {response.text}"
                 return False, {"error": error_message}
         except Exception as e:
+            # In hybrid mode, store locally as fallback
+            if mode == 'hybrid':
+                self._mining_mode = status
+                return True, {'mining_mode': status, 'stored': 'local_fallback'}
             error_message = f"Error in setMiningMode: {str(e)}"
             return False, {"error": error_message}
 
@@ -1505,9 +1542,30 @@ class SatoriServerClient(object):
 
     def loopbackCheck(self, ipAddress:Union[str, None], port: Union[int, None]) -> bool:
         """
-        asks the central server (could ask fellow Neurons) if our own dataserver
-        is publically reachable.
+        Check if our data server is publicly reachable.
+
+        In P2P mode, uses libp2p's NAT traversal (AutoNAT).
+        In hybrid/central mode, asks central server.
         """
+        mode = _get_networking_mode()
+
+        # In P2P mode, use libp2p's NAT detection if available
+        if mode == 'p2p' and self._p2p_client:
+            try:
+                client = self._p2p_client
+                # Check if we're publicly reachable via libp2p
+                if hasattr(client, 'is_publicly_reachable'):
+                    return client.is_publicly_reachable()
+                # Fallback: assume we're reachable if we have external addresses
+                if hasattr(client, 'get_external_addresses'):
+                    addrs = client.get_external_addresses()
+                    return len(addrs) > 0
+            except Exception as e:
+                logging.warning(f"P2P loopback check failed: {e}")
+            # In pure P2P mode, assume reachable (libp2p handles NAT traversal)
+            return True
+
+        # Hybrid/central: ask central server
         try:
             response = self._makeUnauthenticatedCall(
                 function=requests.post,
@@ -1521,10 +1579,9 @@ class SatoriServerClient(object):
                 except Exception as e:
                     return False
             else:
-                error_message = f"Server returned status code {response.status_code}: {response.text}"
                 return False
         except Exception as e:
-            error_message = f"Error in setMiningMode: {str(e)}"
+            logging.warning(f"Loopback check failed: {e}")
             return False
 
     def getSubscribers(self) -> tuple[bool, list]:
@@ -1620,20 +1677,43 @@ class SatoriServerClient(object):
 
     def setDataManagerPort(self, port: int) -> tuple[bool, list]:
         """
-        asks the central server (could ask fellow Neurons) if our own dataserver
-        is publically reachable.
+        Set the data manager port.
+
+        In P2P mode, stores locally and updates peer announcement.
+        In hybrid/central mode, syncs with central server.
         """
+        mode = _get_networking_mode()
+
+        # In P2P mode, store locally and update peer announcement
+        if mode == 'p2p':
+            self._data_manager_port = port
+            # Update P2P announcement if available
+            if self._p2p_client:
+                try:
+                    client = self._p2p_client
+                    if hasattr(client, 'update_announcement'):
+                        client.update_announcement(data_port=port)
+                except Exception as e:
+                    logging.warning(f"Failed to update P2P announcement: {e}")
+            return True, {'port': port, 'stored': 'local'}
+
+        # Hybrid/central: sync with server
         try:
             response = self._makeAuthenticatedCall(
                 function=requests.get,
                 endpoint=f'/api/v0/datamanager/port/set/{port}')
             if 200 <= response.status_code < 400:
+                self._data_manager_port = port
                 return True, response.json()
             else:
                 error_message = f"Server returned status code {response.status_code}: {response.text}"
                 return False, {"error": error_message}
         except Exception as e:
-            error_message = f"Error in setMiningMode: {str(e)}"
+            # In hybrid mode, store locally as fallback
+            if mode == 'hybrid':
+                self._data_manager_port = port
+                return True, {'port': port, 'stored': 'local_fallback'}
+            error_message = f"Error in setDataManagerPort: {str(e)}"
             return False, {"error": error_message}
 
 
@@ -1708,3 +1788,612 @@ class SatoriServerClient(object):
         except Exception as e:
             error_message = f"Error in setMiningMode: {str(e)}"
             return False, {"error": error_message}
+
+    # ========================================================================
+    # DONATION API METHODS (Central fallback for P2P donation system)
+    # ========================================================================
+
+    def getTreasuryAddress(self) -> tuple[bool, dict]:
+        """Get the multi-sig treasury address for donations."""
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/donation/treasury-address')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def submitDonation(
+        self,
+        amount: float,
+        tx_hash: str,
+        donor_address: str,
+    ) -> tuple[bool, dict]:
+        """
+        Submit a donation record to the central server.
+
+        This is called after the EVR transaction is broadcast to record
+        the donation for reward tracking.
+
+        Args:
+            amount: Amount of EVR donated
+            tx_hash: Evrmore transaction hash
+            donor_address: Donor's wallet address
+
+        Returns:
+            Tuple of (success, response_data)
+        """
+        try:
+            response = self._makeAuthenticatedCall(
+                function=requests.post,
+                endpoint='/api/v0/donation/submit',
+                payload=json.dumps({
+                    'amount': amount,
+                    'tx_hash': tx_hash,
+                    'donor_address': donor_address,
+                }))
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def getDonorStats(self, donor_address: str = None) -> tuple[bool, dict]:
+        """
+        Get donation statistics for a donor.
+
+        Args:
+            donor_address: Address to query (None = authenticated wallet)
+
+        Returns:
+            Tuple of (success, stats_dict) where stats_dict contains:
+            {
+                'total_donated': float,
+                'tier': str,
+                'next_tier': str,
+                'next_tier_threshold': float,
+                'progress_to_next': float,
+                'rewards_received': float,
+                'donation_count': int,
+                'first_donation_ts': int,
+                'latest_donation_ts': int,
+                'tier_badges': list[str],
+            }
+        """
+        try:
+            endpoint = '/api/v0/donation/stats'
+            if donor_address:
+                endpoint += f'/{donor_address}'
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint=endpoint)
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def getDonationHistory(
+        self,
+        donor_address: str = None,
+        limit: int = 50,
+        offset: int = 0
+    ) -> tuple[bool, list]:
+        """
+        Get donation history for a donor.
+
+        Args:
+            donor_address: Address to query (None = authenticated wallet)
+            limit: Max records to return
+            offset: Pagination offset
+
+        Returns:
+            Tuple of (success, list of donation records)
+        """
+        try:
+            endpoint = f'/api/v0/donation/history?limit={limit}&offset={offset}'
+            if donor_address:
+                endpoint += f'&address={donor_address}'
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint=endpoint)
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, []
+        except Exception as e:
+            logging.warning(f"Failed to get donation history: {e}")
+            return False, []
+
+    def getTopDonors(self, limit: int = 20) -> tuple[bool, list]:
+        """
+        Get top donors leaderboard.
+
+        Args:
+            limit: Max donors to return
+
+        Returns:
+            Tuple of (success, list of donor stats)
+        """
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint=f'/api/v0/donation/top-donors?limit={limit}')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, []
+        except Exception as e:
+            logging.warning(f"Failed to get top donors: {e}")
+            return False, []
+
+    def getTierAchievements(self, tier: str = None) -> tuple[bool, list]:
+        """
+        Get tier achievements (first-to-tier unique badges).
+
+        Args:
+            tier: Optional filter by tier name
+
+        Returns:
+            Tuple of (success, list of achievement records)
+        """
+        try:
+            endpoint = '/api/v0/donation/achievements'
+            if tier:
+                endpoint += f'?tier={tier}'
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint=endpoint)
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, []
+        except Exception as e:
+            logging.warning(f"Failed to get tier achievements: {e}")
+            return False, []
+
+    def getDonationRate(self) -> tuple[bool, dict]:
+        """
+        Get current EVR to SATORI donation exchange rate.
+
+        Returns:
+            Tuple of (success, rate_dict) where rate_dict contains:
+            {
+                'evr_to_satori': float,
+                'min_donation': float,
+                'max_donation': float,
+                'updated_at': int,
+            }
+        """
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/donation/rate')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"evr_to_satori": 0.01, "min_donation": 1, "max_donation": 1000000}
+        except Exception as e:
+            logging.warning(f"Failed to get donation rate: {e}")
+            return False, {"evr_to_satori": 0.01, "min_donation": 1, "max_donation": 1000000}
+
+    # ========================================================================
+    # SIGNER API METHODS (For authorized multi-sig signers)
+    # ========================================================================
+
+    def isAuthorizedSigner(self, address: str = None) -> bool:
+        """
+        Check if an address is an authorized signer.
+
+        Args:
+            address: Address to check (None = authenticated wallet)
+
+        Returns:
+            True if authorized signer
+        """
+        try:
+            endpoint = '/api/v0/signer/check'
+            if address:
+                endpoint += f'/{address}'
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint=endpoint)
+            if response.status_code == 200:
+                return response.json().get('is_signer', False)
+            return False
+        except Exception as e:
+            logging.warning(f"Failed to check signer status: {e}")
+            return False
+
+    def getSignerPendingRequests(self) -> tuple[bool, list]:
+        """
+        Get pending signature requests for authorized signers.
+
+        Returns:
+            Tuple of (success, list of pending requests)
+        """
+        try:
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/signer/pending')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, []
+        except Exception as e:
+            logging.warning(f"Failed to get pending requests: {e}")
+            return False, []
+
+    def approveSignerRequest(self, request_id: str, signature: str = None) -> tuple[bool, dict]:
+        """
+        Approve and sign a pending request.
+
+        Args:
+            request_id: ID of request to approve
+            signature: Pre-computed signature (None = sign with wallet)
+
+        Returns:
+            Tuple of (success, response_dict)
+        """
+        try:
+            payload = {'request_id': request_id}
+            if signature:
+                payload['signature'] = signature
+            response = self._makeAuthenticatedCall(
+                function=requests.post,
+                endpoint='/api/v0/signer/approve',
+                payload=json.dumps(payload))
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def rejectSignerRequest(self, request_id: str, reason: str = None) -> tuple[bool, dict]:
+        """
+        Reject a pending request.
+
+        Args:
+            request_id: ID of request to reject
+            reason: Optional rejection reason
+
+        Returns:
+            Tuple of (success, response_dict)
+        """
+        try:
+            payload = {'request_id': request_id}
+            if reason:
+                payload['reason'] = reason
+            response = self._makeAuthenticatedCall(
+                function=requests.post,
+                endpoint='/api/v0/signer/reject',
+                payload=json.dumps(payload))
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def getSignerRequestStatus(self, request_id: str) -> tuple[bool, dict]:
+        """
+        Get status of a signing request.
+
+        Args:
+            request_id: ID of request
+
+        Returns:
+            Tuple of (success, status_dict)
+        """
+        try:
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint=f'/api/v0/signer/request/{request_id}')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"error": f"Status {response.status_code}: {response.text}"}
+        except Exception as e:
+            return False, {"error": str(e)}
+
+    def getTreasuryBalance(self) -> tuple[bool, dict]:
+        """
+        Get treasury balance (for signer dashboard).
+
+        Returns:
+            Tuple of (success, balance_dict) with EVR and SATORI balances
+        """
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/signer/treasury-balance')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {"evr": 0, "satori": 0}
+        except Exception as e:
+            logging.warning(f"Failed to get treasury balance: {e}")
+            return False, {"evr": 0, "satori": 0}
+
+    # =========================================================================
+    # TREASURY ALERTS & DEFERRED REWARDS
+    # =========================================================================
+
+    def getTreasuryAlertStatus(self) -> tuple[bool, dict]:
+        """
+        Get current treasury status and active alerts.
+
+        Returns:
+            Tuple of (success, status_dict) with:
+            - severity: 'info'|'warning'|'critical'
+            - satori_level: Treasury SATORI status
+            - evr_level: Treasury EVR status
+            - active_alert: Current active alert if any
+        """
+        mode = _get_networking_mode()
+
+        # Try P2P first in hybrid/p2p mode
+        if mode in ('hybrid', 'p2p') and self._p2p_client:
+            try:
+                client = self._p2p_client
+                if client and client.get('alert_manager'):
+                    manager = client['alert_manager']
+                    if hasattr(manager, 'get_current_status'):
+                        status = manager.get_current_status()
+                        if status:
+                            result = {
+                                'severity': status.severity,
+                                'satori_level': status.satori_level,
+                                'evr_level': status.evr_level,
+                                'satori_balance': getattr(status, 'satori_balance', None),
+                                'evr_balance': getattr(status, 'evr_balance', None),
+                                'active_alert': None,
+                            }
+                            if hasattr(manager, 'get_active_alert'):
+                                alert = manager.get_active_alert()
+                                if alert:
+                                    result['active_alert'] = {
+                                        'type': alert.alert_type,
+                                        'severity': alert.severity,
+                                        'message': alert.message,
+                                        'timestamp': alert.timestamp,
+                                    }
+                            return True, result
+            except Exception as e:
+                logging.warning(f"P2P treasury alert status failed: {e}")
+                if mode == 'p2p':
+                    return False, {'error': str(e)}
+
+        # Central fallback
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/treasury/status')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {'severity': 'info', 'satori_level': 'Unknown', 'evr_level': 'Unknown'}
+        except Exception as e:
+            logging.warning(f"Failed to get treasury alert status: {e}")
+            return False, {'severity': 'info', 'satori_level': 'Unknown', 'evr_level': 'Unknown'}
+
+    def getDeferredRewards(self, address: str = None) -> tuple[bool, dict]:
+        """
+        Get deferred rewards for an address.
+
+        Args:
+            address: Wallet address (uses self.wallet if None)
+
+        Returns:
+            Tuple of (success, summary_dict) with:
+            - total_pending: Total deferred amount
+            - deferred_count: Number of deferred rewards
+            - deferred_rewards: List of individual deferred rewards
+        """
+        address = address or self.wallet.address
+        mode = _get_networking_mode()
+
+        # Try P2P first in hybrid/p2p mode
+        if mode in ('hybrid', 'p2p') and self._p2p_client:
+            try:
+                client = self._p2p_client
+                if client and client.get('deferred_rewards_manager'):
+                    manager = client['deferred_rewards_manager']
+                    if hasattr(manager, 'get_deferred_for_address'):
+                        summary = manager.get_deferred_for_address(address)
+                        if summary:
+                            return True, {
+                                'total_pending': summary.total_pending,
+                                'deferred_count': summary.deferred_count,
+                                'oldest_deferred_at': summary.oldest_deferred_at,
+                                'newest_deferred_at': summary.newest_deferred_at,
+                                'deferred_rewards': [
+                                    {
+                                        'round_id': r.round_id,
+                                        'amount': r.amount,
+                                        'reason': r.reason,
+                                        'created_at': r.created_at,
+                                    }
+                                    for r in summary.deferred_rewards[:20]
+                                ],
+                            }
+            except Exception as e:
+                logging.warning(f"P2P deferred rewards failed: {e}")
+                if mode == 'p2p':
+                    return False, {'error': str(e)}
+
+        # Central fallback
+        try:
+            response = self._makeAuthenticatedCall(
+                function=requests.get,
+                endpoint=f'/api/v0/treasury/deferred/{address}')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {'total_pending': 0, 'deferred_count': 0, 'deferred_rewards': []}
+        except Exception as e:
+            logging.warning(f"Failed to get deferred rewards: {e}")
+            return False, {'total_pending': 0, 'deferred_count': 0, 'deferred_rewards': []}
+
+    def getTreasuryAlertHistory(self, limit: int = 20) -> tuple[bool, list]:
+        """
+        Get recent treasury alert history.
+
+        Args:
+            limit: Maximum number of alerts to return
+
+        Returns:
+            Tuple of (success, alert_list)
+        """
+        mode = _get_networking_mode()
+
+        # Try P2P first in hybrid/p2p mode
+        if mode in ('hybrid', 'p2p') and self._p2p_client:
+            try:
+                client = self._p2p_client
+                if client and client.get('alert_manager'):
+                    manager = client['alert_manager']
+                    if hasattr(manager, 'get_alert_history'):
+                        history = manager.get_alert_history(limit=limit)
+                        return True, [
+                            {
+                                'type': a.alert_type,
+                                'severity': a.severity,
+                                'message': a.message,
+                                'timestamp': a.timestamp,
+                                'resolved': getattr(a, 'resolved', False),
+                                'resolved_at': getattr(a, 'resolved_at', None),
+                            }
+                            for a in history
+                        ]
+            except Exception as e:
+                logging.warning(f"P2P alert history failed: {e}")
+                if mode == 'p2p':
+                    return False, []
+
+        # Central fallback
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint=f'/api/v0/treasury/alerts/history?limit={limit}')
+            if response.status_code == 200:
+                data = response.json()
+                return True, data.get('history', [])
+            else:
+                return False, []
+        except Exception as e:
+            logging.warning(f"Failed to get alert history: {e}")
+            return False, []
+
+    def getTotalDeferredRewards(self) -> tuple[bool, dict]:
+        """
+        Get total deferred rewards across all users (for signer dashboard).
+
+        Returns:
+            Tuple of (success, stats_dict) with aggregate deferred stats
+        """
+        mode = _get_networking_mode()
+
+        # Try P2P first in hybrid/p2p mode
+        if mode in ('hybrid', 'p2p') and self._p2p_client:
+            try:
+                client = self._p2p_client
+                if client and client.get('deferred_rewards_manager'):
+                    manager = client['deferred_rewards_manager']
+                    if hasattr(manager, 'get_stats'):
+                        stats = manager.get_stats()
+                        return True, stats
+            except Exception as e:
+                logging.warning(f"P2P total deferred failed: {e}")
+                if mode == 'p2p':
+                    return False, {'error': str(e)}
+
+        # Central fallback
+        try:
+            response = self._makeUnauthenticatedCall(
+                function=requests.get,
+                endpoint='/api/v0/treasury/deferred/total')
+            if response.status_code == 200:
+                return True, response.json()
+            else:
+                return False, {'total_deferred': 0, 'deferred_count': 0}
+        except Exception as e:
+            logging.warning(f"Failed to get total deferred: {e}")
+            return False, {'total_deferred': 0, 'deferred_count': 0}
+
+    def set_alert_manager(self, manager):
+        """Set the treasury alert manager for P2P mode."""
+        client = self._get_p2p_client()
+        if client:
+            client['alert_manager'] = manager
+
+    def set_deferred_rewards_manager(self, manager):
+        """Set the deferred rewards manager for P2P mode."""
+        client = self._get_p2p_client()
+        if client:
+            client['deferred_rewards_manager'] = manager
+
+    # New protocol feature manager setters
+
+    def set_version_tracker(self, tracker):
+        """Set the peer version tracker for protocol compatibility."""
+        client = self._get_p2p_client()
+        if client:
+            client['version_tracker'] = tracker
+
+    def set_version_negotiator(self, negotiator):
+        """Set the version negotiator for protocol negotiation."""
+        client = self._get_p2p_client()
+        if client:
+            client['version_negotiator'] = negotiator
+
+    def set_storage_manager(self, manager):
+        """Set the storage manager for redundant storage."""
+        client = self._get_p2p_client()
+        if client:
+            client['storage_manager'] = manager
+
+    def set_bandwidth_tracker(self, tracker):
+        """Set the bandwidth tracker for monitoring."""
+        client = self._get_p2p_client()
+        if client:
+            client['bandwidth_tracker'] = tracker
+
+    def set_qos_manager(self, manager):
+        """Set the QoS manager for bandwidth control."""
+        client = self._get_p2p_client()
+        if client:
+            client['qos_manager'] = manager
+
+    def get_protocol_version(self) -> str:
+        """Get the current protocol version."""
+        client = self._get_p2p_client()
+        if client:
+            return client.get('protocol_version', '1.0.0')
+        return '1.0.0'
+
+    def get_bandwidth_stats(self) -> dict:
+        """Get current bandwidth statistics from QoS manager."""
+        client = self._get_p2p_client()
+        if client and client.get('bandwidth_tracker'):
+            tracker = client['bandwidth_tracker']
+            return {
+                'global': tracker.get_global_metrics().to_dict() if hasattr(tracker, 'get_global_metrics') else {},
+                'topics': {t: m.to_dict() for t, m in tracker.get_topic_metrics().items()} if hasattr(tracker, 'get_topic_metrics') else {},
+            }
+        return {'global': {}, 'topics': {}}
+
+    def get_storage_status(self) -> dict:
+        """Get current storage redundancy status."""
+        client = self._get_p2p_client()
+        if client and client.get('storage_manager'):
+            manager = client['storage_manager']
+            if hasattr(manager, 'get_status'):
+                return manager.get_status()
+        return {'status': 'unavailable'}
